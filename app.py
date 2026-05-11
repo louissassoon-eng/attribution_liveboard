@@ -52,6 +52,20 @@ REQUIRE_AUTH = os.environ.get(
     "true" if os.environ.get("RAILWAY_ENVIRONMENT") else "false",
 ).lower() in ("1", "true", "yes")
 
+# Lock the data source. When true, the app auto-loads from BigQuery on visit
+# using BQ_DEFAULT_* settings and users cannot change them. Designed for
+# production deploys. Defaults to true when running on Railway.
+LOCK_DATA_SOURCE = os.environ.get(
+    "LOCK_DATA_SOURCE",
+    "true" if os.environ.get("RAILWAY_ENVIRONMENT") else "false",
+).lower() in ("1", "true", "yes")
+BQ_DEFAULT_TABLE = os.environ.get("BQ_DEFAULT_TABLE", "").strip()
+BQ_DEFAULT_DATE_COLUMN = os.environ.get("BQ_DEFAULT_DATE_COLUMN", "date").strip()
+try:
+    BQ_DEFAULT_LOOKBACK_DAYS = int(os.environ.get("BQ_DEFAULT_LOOKBACK_DAYS", "365"))
+except ValueError:
+    BQ_DEFAULT_LOOKBACK_DAYS = 365
+
 # Default alert thresholds — UK iGaming sensible defaults.
 # All overridable from the sidebar at runtime.
 DEFAULT_THRESHOLDS = {
@@ -786,6 +800,11 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 def _load_data_widget() -> pd.DataFrame | None:
+    # Production / locked-down mode: auto-load from BQ using env-var settings.
+    # No source picker, no query mode toggle. Users can still hit Refresh.
+    if LOCK_DATA_SOURCE and BQ_DEFAULT_TABLE:
+        return _load_bq_locked()
+
     st.sidebar.header("Data source")
     src = st.sidebar.radio(
         "Load from",
@@ -810,6 +829,46 @@ def _load_data_widget() -> pd.DataFrame | None:
         return None
     # BigQuery branch
     return _load_bq_widget()
+
+
+def _load_bq_locked() -> pd.DataFrame | None:
+    """Production data loader: BigQuery, fully driven by env vars.
+
+    Designed for the deployed app — users don't configure the connection.
+    They see the data loaded automatically with a refresh button and a
+    compact 'last loaded' caption in the sidebar.
+    """
+    where = (
+        f"WHERE {BQ_DEFAULT_DATE_COLUMN} >= DATE_SUB(CURRENT_DATE(), "
+        f"INTERVAL {BQ_DEFAULT_LOOKBACK_DAYS} DAY)"
+        if BQ_DEFAULT_LOOKBACK_DAYS > 0
+        else ""
+    )
+    query = f"SELECT * FROM `{BQ_DEFAULT_TABLE}` {where}".strip()
+
+    with st.sidebar:
+        st.header("Data source")
+        st.caption(f"BigQuery: `{BQ_DEFAULT_TABLE}`")
+        st.caption(
+            f"Window: last {BQ_DEFAULT_LOOKBACK_DAYS} days "
+            f"(by `{BQ_DEFAULT_DATE_COLUMN}`)"
+            if BQ_DEFAULT_LOOKBACK_DAYS > 0
+            else "Window: full table"
+        )
+        if st.button("Refresh data", help="Clears the 5-minute cache and refetches from BigQuery"):
+            load_bq.clear()
+            st.rerun()
+
+    try:
+        df = load_bq(query, None, None)
+        return df
+    except Exception as e:
+        st.error(f"BigQuery query failed: {e}")
+        st.caption(
+            "If this is an access error, ask data to grant `roles/bigquery.dataViewer` "
+            "on the dataset to the deployed service account."
+        )
+        return None
 
 
 def _load_bq_widget() -> pd.DataFrame | None:
