@@ -1,0 +1,10 @@
+streamlit>=1.42,<2.0   # 1.42+ provides st.login / st.user / st.logout for native OIDC auth
+Authlib>=1.3            # required for st.login OIDC support
+pandas>=2.1,<3.0
+numpy>=1.26,<3.0
+plotly>=5.20,<6.0
+python-dateutil>=2.8
+kaleido==0.2.1            # optional, enables Plotly chart image export from the server side
+google-cloud-bigquery>=3.20  # BigQuery client
+db-dtypes>=1.2            # pandas dtype support for BQ types (DATE, TIME, NUMERIC, etc.)
+google-cloud-bigquery-storage>=2.24  # optional but speeds up large BQ pulls
