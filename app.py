@@ -711,10 +711,10 @@ def gate_auth() -> None:
     if not getattr(st, "user", None) or not st.user.is_logged_in:
         st.title(APP_TITLE)
         st.write(
-            f"Sign in with a Google account "
+            f"Sign in with your MrQ account "
             f"({', '.join('@' + d for d in ALLOWED_EMAIL_DOMAINS)}) to continue."
         )
-        if st.button("Sign in with Google", type="primary"):
+        if st.button("Sign in", type="primary"):
             st.login()
         st.stop()
 
