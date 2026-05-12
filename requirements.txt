@@ -1,4 +1,8 @@
-streamlit[auth]>=1.42,<2.0   # [auth] extra pulls Authlib>=1.3.2 + httpx for OIDC support
+streamlit>=1.42,<2.0
+# Auth deps for st.login (OIDC). Listed explicitly because the
+# `streamlit[auth]` extras syntax wasn't being honoured by Railway's builder.
+Authlib>=1.3.2
+httpx>=0.27
 pandas>=2.1,<3.0
 numpy>=1.26,<3.0
 plotly>=5.20,<6.0
