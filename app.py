@@ -432,13 +432,13 @@ def sparkline(values: Iterable[float]) -> go.Figure:
 
 KPI_DEFS = [
     # (label, metric_key, formatter, lower_is_better)
-    ("Spend",        "spend",          fmt_money, False),
-    ("FTDs",         "ftd_players",    fmt_int,   False),
-    ("LTV:CAC",      "ltv_cac",        lambda v: fmt_ratio(v, 2), False),
-    ("CPA (FTD)",    "cpa_ftd",        fmt_money, True),
-    ("pLTV",         "pltv",           fmt_money, False),
-    ("APD1",         "apd1",           fmt_int,   False),
-    ("CPA APD2+",    "cpa_apd2",       fmt_money, True),
+    ("Spend",         "spend",         fmt_money, False),
+    ("FTDs",          "ftd_players",   fmt_int,   False),
+    ("LTV:CAC",       "ltv_cac",       lambda v: fmt_ratio(v, 2), False),
+    ("CPA (FTD)",     "cpa_ftd",       fmt_money, True),
+    ("pLTV",          "pltv",          fmt_money, False),
+    ("FW2+ players",  "apd_2_players", fmt_int,   False),
+    ("CPA APD2+",     "cpa_apd2",      fmt_money, True),
 ]
 
 
