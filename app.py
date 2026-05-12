@@ -66,6 +66,14 @@ try:
 except ValueError:
     BQ_DEFAULT_LOOKBACK_DAYS = 365
 
+# Channels whose spend is brand/awareness rather than performance-attributable.
+# These show up in tables but recommendations don't apply CPA/LTV:CAC scrutiny
+# to them and the "0 FTDs despite spend" trigger is suppressed.
+# Override with BRAND_CHANNELS="ATL,Sponsorship,Out of home" etc.
+BRAND_CHANNELS = set(
+    c.strip() for c in os.environ.get("BRAND_CHANNELS", "ATL").split(",") if c.strip()
+)
+
 # Default alert thresholds — UK iGaming sensible defaults.
 # All overridable from the sidebar at runtime.
 DEFAULT_THRESHOLDS = {
@@ -502,6 +510,26 @@ def build_recommendations(
 
         reasons: list[str] = []
         rec = "Hold"
+
+        # Brand / above-the-line channels: not click-through attributable.
+        # Skip performance scrutiny entirely.
+        entity_channel = r.get("channel") if "channel" in group_cols else None
+        if entity_channel and entity_channel in BRAND_CHANNELS:
+            rows.append({
+                **{c: r[c] for c in group_cols},
+                "spend": spend,
+                "ftds": ftds,
+                "cpa_ftd": r.get("cpa_ftd"),
+                "cpa_ftd_Δ%": cpa_change,
+                "ltv_cac": r.get("ltv_cac"),
+                "ltv_cac_Δ%": ltv_cac_change,
+                "cpa_apd2": r.get("cpa_apd2"),
+                "cpa_apd2_Δ%": apd2_cpa_change,
+                "recommendation": "Brand",
+                "reasons": f"Brand / above-the-line — performance attribution doesn't apply ({fmt_money(spend)} spend)",
+                "confidence": "N/A",
+            })
+            continue
 
         # Min spend gate
         if spend < thresholds["min_spend_for_alert"]:
@@ -1453,12 +1481,18 @@ def page_recommendations(df_curr, df_prev, thresholds):
 
     recs = build_recommendations(df_curr_g, df_prev_g, cols, thresholds)
     counts = recs["recommendation"].value_counts().to_dict()
-    cols_kpi = st.columns(3)
+    cols_kpi = st.columns(4)
     cols_kpi[0].metric("Scale", counts.get("Scale", 0))
     cols_kpi[1].metric("Hold", counts.get("Hold", 0))
     cols_kpi[2].metric("Investigate", counts.get("Investigate", 0))
+    cols_kpi[3].metric("Brand", counts.get("Brand", 0),
+                       help="Brand/above-the-line channels excluded from performance scrutiny")
 
-    flt = st.multiselect("Filter recommendation", ["Scale", "Hold", "Investigate"], default=["Scale", "Investigate"])
+    flt = st.multiselect(
+        "Filter recommendation",
+        ["Scale", "Hold", "Investigate", "Brand"],
+        default=["Scale", "Investigate"],
+    )
     show = recs[recs["recommendation"].isin(flt)] if flt else recs
     st.dataframe(show.round(2), use_container_width=True, hide_index=True)
     st.download_button(
@@ -1527,6 +1561,7 @@ Heuristic only — they support, not replace, judgement.
 - **Scale** — spend ≥ gate, FTDs ≥ minimum, LTV:CAC ≥ floor, AND either CPA improved enough OR LTV:CAC improving.
 - **Investigate** — at least one of: CPA deteriorated past threshold, LTV:CAC deteriorated past threshold, APD2+ CPA deteriorated past threshold.
 - **Hold** — everything else, or below the spend gate.
+- **Brand** — channels in `BRAND_CHANNELS` env var (default: `ATL`). These are above-the-line / brand / awareness channels where click-through attribution doesn't apply, so they're excluded from CPA/LTV:CAC scrutiny. Spend still shows in summaries; just no Scale/Hold/Investigate verdict.
 
 Confidence labels reflect spend × FTD volume only. They are **not** statistical significance.
 
