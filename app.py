@@ -826,9 +826,11 @@ def main() -> None:
     # Page nav (tabs across the top). st.tabs renders all bodies on every
     # rerun, but the heavy work (BQ fetch + _shape) is cached, so this is
     # cheap. Per-page aggregations are recomputed cheaply from the shaped df.
-    tab_overview, tab_channels, tab_explorer, tab_dq, tab_recs, tab_dict = st.tabs([
+    (tab_overview, tab_channels, tab_saturation, tab_explorer,
+     tab_dq, tab_recs, tab_dict) = st.tabs([
         "Executive Overview",
         "Channel View",
+        "Saturation",
         "Campaign / Ad Explorer",
         "Data Quality",
         "Recommendations",
@@ -838,6 +840,8 @@ def main() -> None:
         page_overview(df, df_curr_eff, df_prev_eff, period, prev_period_obj, thresholds)
     with tab_channels:
         page_channels(df_curr_eff, df_prev_eff)
+    with tab_saturation:
+        page_saturation(df, filters)
     with tab_explorer:
         page_explorer(df_curr, df_prev)  # explorer respects own row-type filter
     with tab_dq:
@@ -1321,6 +1325,205 @@ def page_channels(df_curr, df_prev):
             cdf[f"{c}_share_%"] = (cdf[c] / tot * 100) if tot else np.nan
     cdf = cdf.sort_values("spend", ascending=False)
     st.dataframe(cdf.round(2), use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# 15b. PAGE: SATURATION CURVES
+# ---------------------------------------------------------------------------
+
+def page_saturation(df_full: pd.DataFrame, filters: dict) -> None:
+    """Diminishing-returns / saturation analysis at channel level.
+
+    Uses ALL available history (not just the selected period) because curve
+    fitting needs as many weekly observations as possible. Respects sidebar
+    filters except date range.
+
+    Method: aggregate weekly per channel, fit FTDs = a·log(spend) + b, derive
+    marginal CPA = spend/a at any spend level. Compare against historical
+    average CPA to surface the 'saturation point' where adding £1 of spend
+    costs more than the channel's average CPA.
+    """
+    st.header("Saturation curves")
+    st.caption(
+        "Weekly spend vs weekly outcome per channel. A concave curve means "
+        "diminishing returns are kicking in; a near-straight line means the "
+        "channel still has headroom. Built from the full data window pulled, "
+        "not just the currently-selected period."
+    )
+
+    if df_full.empty or "channel" not in df_full.columns:
+        st.warning("No data available.")
+        return
+
+    # Apply non-date sidebar filters
+    df_use = _apply_filters(df_full, {k: v for k, v in filters.items()
+                                      if k not in ("date",)})
+
+    # Only model paid channels — brand channels aren't click-through attributable
+    paid = df_use[~df_use["channel"].isin(BRAND_CHANNELS)]
+
+    # Pick channels with enough historical activity to be worth modelling
+    ch_summary = paid.groupby("channel").agg(
+        spend=("spend", "sum"),
+        ftds=("ftd_players", "sum"),
+        weeks=("week_start", "nunique"),
+    ).reset_index()
+    eligible = ch_summary[(ch_summary["spend"] >= 5000) &
+                          (ch_summary["ftds"] >= 50) &
+                          (ch_summary["weeks"] >= 4)]
+    if eligible.empty:
+        st.warning(
+            "No channels in this dataset have ≥£5k spend, ≥50 FTDs, and ≥4 "
+            "weeks of activity — saturation modelling needs more history. "
+            "Try a wider lookback (BQ_DEFAULT_LOOKBACK_DAYS env var)."
+        )
+        return
+
+    eligible = eligible.sort_values("spend", ascending=False)
+    cols = st.columns([2, 1, 1])
+    channel = cols[0].selectbox(
+        "Channel",
+        eligible["channel"].tolist(),
+        help="Only channels with enough history to model are listed.",
+    )
+    outcome_metric = cols[1].selectbox(
+        "Outcome metric",
+        ["FTDs", "pLTV", "APD2+ players"],
+        index=0,
+    )
+    model_choice = cols[2].selectbox(
+        "Curve fit",
+        ["Log (default)", "Square-root"],
+        index=0,
+    )
+
+    # Build weekly series
+    ch_df = paid[paid["channel"] == channel]
+    metric_col = {
+        "FTDs": "ftd_players",
+        "pLTV": "sum_pltv",
+        "APD2+ players": "apd_2_players",
+    }[outcome_metric]
+    weekly = (ch_df.groupby("week_start")
+              .agg(spend=("spend", "sum"), outcome=(metric_col, "sum"))
+              .reset_index())
+    weekly = weekly[(weekly["spend"] > 0) & weekly["spend"].notna()].copy()
+
+    if len(weekly) < 4:
+        st.warning(f"Only {len(weekly)} weeks of spend in this channel. Need ≥4.")
+        return
+
+    x = weekly["spend"].astype(float).values
+    y = weekly["outcome"].astype(float).values
+
+    # Fit
+    if model_choice.startswith("Log"):
+        transform = np.log
+        inverse_marginal = lambda spend, a: a / spend
+        # FTDs = a·ln(spend) + b ; d/dx = a/x ; marginal cost = x/a
+        marginal_cost = lambda spend, a: spend / a if a > 0 else float("inf")
+        model_label = "FTDs ≈ a · ln(spend) + b"
+    else:
+        transform = np.sqrt
+        # FTDs = a·sqrt(spend) + b ; d/dx = a/(2·sqrt(x)) ; marginal cost = 2·sqrt(x)/a
+        inverse_marginal = lambda spend, a: a / (2 * np.sqrt(spend))
+        marginal_cost = lambda spend, a: 2 * np.sqrt(spend) / a if a > 0 else float("inf")
+        model_label = "FTDs ≈ a · √spend + b"
+
+    x_t = transform(x)
+    # Linear regression on transformed x
+    a, b = np.polyfit(x_t, y, 1)
+    pred = a * x_t + b
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    # Plot scatter + fitted curve
+    x_range_min = max(weekly["spend"].min() * 0.5, 1.0)
+    x_range_max = weekly["spend"].max() * 1.5
+    x_range = np.linspace(x_range_min, x_range_max, 200)
+    y_curve = a * transform(x_range) + b
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=weekly["spend"], y=weekly["outcome"], mode="markers",
+        name="Weekly observations",
+        text=weekly["week_start"].dt.strftime("%Y-%m-%d"),
+        marker=dict(size=8, opacity=0.7),
+        hovertemplate="Week of %{text}<br>Spend: £%{x:,.0f}<br>" +
+                      outcome_metric + ": %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=x_range, y=y_curve, mode="lines",
+        name=f"Fit (R²={r2:.2f})", line=dict(width=2),
+    ))
+    fig.update_layout(
+        height=440, margin=dict(l=10, r=10, t=10, b=10),
+        xaxis_title="Weekly spend (£)", yaxis_title=f"Weekly {outcome_metric}",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Summary metrics
+    recent_spend = float(weekly.tail(4)["spend"].mean())  # avg of last 4 weeks
+    cols2 = st.columns(4)
+    cols2[0].metric("R² of fit", f"{r2:.2f}",
+                    help="Closer to 1 means the curve explains weekly variation well.")
+    cols2[1].metric("Avg weekly spend (last 4w)", fmt_money(recent_spend))
+    cols2[2].metric(f"Marginal cost per {outcome_metric.rstrip('s')}",
+                    fmt_money(marginal_cost(recent_spend, a)) if a > 0 else "n/a",
+                    help="Approximate cost of one more outcome unit if you added £1 at this spend level.")
+    avg_cpa = float(weekly["spend"].sum() / weekly["outcome"].sum()) if weekly["outcome"].sum() > 0 else float("nan")
+    cols2[3].metric(f"Historical avg cost per {outcome_metric.rstrip('s')}",
+                    fmt_money(avg_cpa) if not pd.isna(avg_cpa) else "n/a")
+
+    # Interpretation
+    if r2 < 0.3:
+        st.warning(
+            f"Low fit quality (R²={r2:.2f}). The curve doesn't explain weekly "
+            "variation well — could be noise, mixed sub-campaigns, audience "
+            "drift, or a genuinely linear (unsaturated) channel. Treat the "
+            "marginal cost number with scepticism."
+        )
+    elif a <= 0:
+        st.error(
+            "Fitted coefficient is non-positive — model thinks spending more "
+            "produces fewer outcomes, which is implausible. Likely cause: "
+            "data quality, attribution windowing, or a confounding variable. "
+            "Don't act on this curve until the underlying data is reviewed."
+        )
+    else:
+        marginal_at_recent = marginal_cost(recent_spend, a)
+        if marginal_at_recent > 0 and not pd.isna(avg_cpa) and avg_cpa > 0:
+            # Saturation point: where marginal cost equals avg cost
+            # Log: spend / a = avg_cpa → spend = avg_cpa · a
+            # Sqrt: 2·sqrt(spend)/a = avg_cpa → spend = (a·avg_cpa/2)²
+            if model_choice.startswith("Log"):
+                sat_spend = avg_cpa * a
+            else:
+                sat_spend = (a * avg_cpa / 2) ** 2
+            ratio = marginal_at_recent / avg_cpa if avg_cpa else float("inf")
+            verdict = (
+                "**Headroom**: spending less than the saturation point — "
+                f"adding £1 buys outcomes at {ratio:.0%} of the historical average cost."
+                if ratio < 1
+                else "**Saturated**: marginal cost is now equal to or above the average — "
+                     "adding budget here is buying outcomes at worse than your historical norm."
+            )
+            st.info(
+                f"Model: {model_label}, a={a:.2f}, b={b:.2f}. "
+                f"Saturation point (where marginal cost = average cost): ~{fmt_money(sat_spend)}/week. "
+                f"Recent weekly spend: {fmt_money(recent_spend)}. {verdict}"
+            )
+
+    # Underlying weekly data
+    with st.expander("Weekly observations used"):
+        st.dataframe(
+            weekly.assign(week=weekly["week_start"].dt.strftime("%Y-%m-%d"))[
+                ["week", "spend", "outcome"]
+            ].rename(columns={"outcome": outcome_metric}).round(2),
+            use_container_width=True, hide_index=True,
+        )
 
 
 # ---------------------------------------------------------------------------
