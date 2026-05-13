@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -73,6 +74,30 @@ except ValueError:
 BRAND_CHANNELS = set(
     c.strip() for c in os.environ.get("BRAND_CHANNELS", "ATL").split(",") if c.strip()
 )
+
+# Data-day cutoff: BQ refresh happens before this time. Cache invalidates daily
+# at this UK-local time so a morning visit gets the fresh-loaded data.
+DATA_DAY_CUTOFF_HOUR = int(os.environ.get("DATA_DAY_CUTOFF_HOUR", "8"))
+DATA_DAY_CUTOFF_MINUTE = int(os.environ.get("DATA_DAY_CUTOFF_MINUTE", "30"))
+UK_TZ = ZoneInfo("Europe/London")
+
+
+def _data_day_key() -> str:
+    """Cache key that flips once per day at DATA_DAY_CUTOFF UK time.
+
+    Before the cutoff, we still consider the previous day current (BQ hasn't
+    refreshed yet). After the cutoff, today becomes the new data day.
+    """
+    now = datetime.now(UK_TZ)
+    cutoff = now.replace(
+        hour=DATA_DAY_CUTOFF_HOUR,
+        minute=DATA_DAY_CUTOFF_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if now < cutoff:
+        return (now.date() - timedelta(days=1)).isoformat()
+    return now.date().isoformat()
 
 # Default alert thresholds — UK iGaming sensible defaults.
 # All overridable from the sidebar at runtime.
@@ -185,13 +210,16 @@ def load_path(path: str) -> pd.DataFrame:
     return _shape(df)
 
 
-@st.cache_data(ttl=300, show_spinner="Querying BigQuery…")
-def load_bq(query: str, key_path: str | None, project_override: str | None) -> pd.DataFrame:
+@st.cache_data(ttl=86400, show_spinner="Querying BigQuery…")
+def load_bq(query: str, key_path: str | None, project_override: str | None,
+            data_day: str = "") -> pd.DataFrame:
     """
     Run a SQL query against BigQuery and return a shaped DataFrame.
 
-    Cached for 5 minutes per (query, key_path, project) tuple. Use the
-    'Refresh data' button in the sidebar to bust the cache early.
+    Cached per (query, key_path, project, data_day) tuple. data_day flips once
+    per day at the configured UK cutoff time so the morning's first visit gets
+    fresh data; subsequent visits within the same data-day are served from
+    cache. Use the 'Refresh data' button in the sidebar to bust early.
 
     Auth resolution:
       1. If key_path is given, use that JSON key file.
@@ -795,31 +823,28 @@ def main() -> None:
 
     _interpretation_banner(df_curr, include_unmatched, period, prev_period_obj, prev_mode)
 
-    # Page nav (radio in sidebar)
-    page = st.sidebar.radio(
-        "Page",
-        [
-            "Executive Overview",
-            "Channel View",
-            "Campaign / Ad Explorer",
-            "Data Quality / Attribution Health",
-            "Recommendations",
-            "Metric Dictionary / Rules",
-        ],
-        index=0,
-    )
-
-    if page == "Executive Overview":
+    # Page nav (tabs across the top). st.tabs renders all bodies on every
+    # rerun, but the heavy work (BQ fetch + _shape) is cached, so this is
+    # cheap. Per-page aggregations are recomputed cheaply from the shaped df.
+    tab_overview, tab_channels, tab_explorer, tab_dq, tab_recs, tab_dict = st.tabs([
+        "Executive Overview",
+        "Channel View",
+        "Campaign / Ad Explorer",
+        "Data Quality",
+        "Recommendations",
+        "Dictionary",
+    ])
+    with tab_overview:
         page_overview(df, df_curr_eff, df_prev_eff, period, prev_period_obj, thresholds)
-    elif page == "Channel View":
+    with tab_channels:
         page_channels(df_curr_eff, df_prev_eff)
-    elif page == "Campaign / Ad Explorer":
+    with tab_explorer:
         page_explorer(df_curr, df_prev)  # explorer respects own row-type filter
-    elif page == "Data Quality / Attribution Health":
+    with tab_dq:
         page_data_quality(df_curr, period, thresholds)
-    elif page == "Recommendations":
+    with tab_recs:
         page_recommendations(df_curr_eff, df_prev_eff, thresholds)
-    else:
+    with tab_dict:
         page_dictionary()
 
 
@@ -874,6 +899,7 @@ def _load_bq_locked() -> pd.DataFrame | None:
     )
     query = f"SELECT * FROM `{BQ_DEFAULT_TABLE}` {where}".strip()
 
+    data_day = _data_day_key()
     with st.sidebar:
         st.header("Data source")
         st.caption(f"BigQuery: `{BQ_DEFAULT_TABLE}`")
@@ -883,12 +909,16 @@ def _load_bq_locked() -> pd.DataFrame | None:
             if BQ_DEFAULT_LOOKBACK_DAYS > 0
             else "Window: full table"
         )
-        if st.button("Refresh data", help="Clears the 5-minute cache and refetches from BigQuery"):
+        st.caption(
+            f"Data day: {data_day} "
+            f"(auto-refresh at {DATA_DAY_CUTOFF_HOUR:02d}:{DATA_DAY_CUTOFF_MINUTE:02d} UK)"
+        )
+        if st.button("Refresh data now", help="Clears the cache and refetches from BigQuery immediately"):
             load_bq.clear()
             st.rerun()
 
     try:
-        df = load_bq(query, None, None)
+        df = load_bq(query, None, None, data_day)
         return df
     except Exception as e:
         st.error(f"BigQuery query failed: {e}")
@@ -974,7 +1004,7 @@ def _load_bq_widget() -> pd.DataFrame | None:
 
         if run:
             try:
-                df = load_bq(query, key_path or None, project or None)
+                df = load_bq(query, key_path or None, project or None, _data_day_key())
                 st.session_state["_bq_df"] = df
                 st.session_state["_bq_last"] = {
                     "query": query,
