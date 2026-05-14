@@ -1653,10 +1653,18 @@ def _non_atl_media_columns(df: pd.DataFrame) -> list[str]:
 def page_mmm(mmm_data: dict | None) -> None:
     st.header("MMM / ATL attribution")
     st.caption(
-        "Reads Colin's MMM spreadsheet to surface how much of weekly Immediate "
-        "FTDs the model attributes to Above-The-Line media. The headline chart "
-        "is the answer to 'what looks organic but is actually being driven by "
-        "TV / Radio / OOH / Sponsorship / Audio etc.'"
+        "Reads Colin's MMM spreadsheet (Analytic Partners) to surface how much of "
+        "weekly Immediate FTDs the model attributes to Above-The-Line media. The "
+        "headline chart is the answer to 'what looks organic but is actually "
+        "being driven by TV / Radio / OOH / Sponsorship / Audio etc.'"
+    )
+    st.warning(
+        "**KPI change note (Round 3, Apr 2026)**: The current MMM round models "
+        "**Immediate FTDs** (same-day registration + deposit). Earlier rounds "
+        "modelled **Total FTDs**. Don't compare absolute numbers across rounds — "
+        "the methodology shifted. PAP Wagers is the other modelled outcome and "
+        "is consistent across rounds.",
+        icon="⚠️",
     )
 
     if mmm_data is None:
@@ -1676,8 +1684,12 @@ def page_mmm(mmm_data: dict | None) -> None:
         st.error("Couldn't find a usable `FTD by Channel` sheet in the upload.")
         return
 
-    # Outcome toggle
-    outcome = st.radio("Outcome", ["Immediate FTDs", "PAPs"], horizontal=True, index=0)
+    # Outcome toggle. Internal value stays "PAPs" (matches column name in
+    # Colin's sheet) but the label users see is "PAP Wagers" to match
+    # Analytic Partners' precise terminology.
+    OUTCOME_LABELS = {"Immediate FTDs": "FTDs", "PAP Wagers": "PAPs"}
+    outcome_label = st.radio("Outcome", list(OUTCOME_LABELS.keys()), horizontal=True, index=0)
+    outcome = "Immediate FTDs" if outcome_label == "Immediate FTDs" else "PAPs"
     src = ftd if outcome == "Immediate FTDs" else pap
     if src is None or src.empty:
         st.warning(f"No `{outcome}` sheet found in the upload.")
@@ -1717,7 +1729,7 @@ def page_mmm(mmm_data: dict | None) -> None:
         agg["Non-media (organic / unattributed)"] = 0
 
     # === HEADLINE CHART: stacked area showing the ATL wedge under the total ===
-    st.subheader(f"Weekly {outcome} — what MMM says is ATL-driven")
+    st.subheader(f"Weekly {outcome_label} — what MMM says is ATL-driven")
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=agg["week_start"], y=agg["Non-media (organic / unattributed)"],
@@ -1740,7 +1752,7 @@ def page_mmm(mmm_data: dict | None) -> None:
     ))
     fig.update_layout(
         height=460, hovermode="x unified",
-        yaxis_title=outcome, xaxis_title="Week",
+        yaxis_title=outcome_label, xaxis_title="Week",
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         margin=dict(l=10, r=10, t=10, b=10),
     )
@@ -1752,7 +1764,7 @@ def page_mmm(mmm_data: dict | None) -> None:
     total_other = float(agg["Other media (MMM-attributed)"].sum())
     total_organic = float(agg["Non-media (organic / unattributed)"].sum())
     cols = st.columns(4)
-    cols[0].metric(f"Total {outcome}", fmt_int(total_outcome))
+    cols[0].metric(f"Total {outcome_label}", fmt_int(total_outcome))
     cols[1].metric("ATL-attributed",
                    fmt_int(total_atl),
                    delta=f"{(total_atl/total_outcome*100):.1f}% share" if total_outcome else None,
@@ -1765,7 +1777,7 @@ def page_mmm(mmm_data: dict | None) -> None:
                    delta_color="off")
 
     # === Per-channel MMM-attributed FTDs over time ===
-    st.subheader(f"{outcome} by channel (MMM attribution)")
+    st.subheader(f"{outcome_label} by channel (MMM attribution)")
     long_rows = []
     for ch in atl_cols + other_cols:
         for _, r in src[["week_start", ch]].iterrows():
@@ -1776,7 +1788,7 @@ def page_mmm(mmm_data: dict | None) -> None:
     if not long_df.empty:
         fig2 = px.line(long_df, x="week_start", y="value", color="channel",
                        facet_col="group", facet_col_wrap=1,
-                       title=f"{outcome} per channel — left side ATL, right side digital media")
+                       title=f"{outcome_label} per channel — left side ATL, right side digital media")
         fig2.update_layout(height=520, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig2, use_container_width=True)
 
@@ -1818,18 +1830,18 @@ def page_mmm(mmm_data: dict | None) -> None:
                 cmp = spend_w[["week_start"]].copy()
                 cmp["ATL spend (£)"] = spend_w[atl_spend_cols].sum(axis=1)
                 cmp = cmp.merge(agg[["week_start", "ATL (MMM-attributed)"]], on="week_start", how="inner")
-                cmp = cmp.rename(columns={"ATL (MMM-attributed)": f"ATL {outcome}"})
+                cmp = cmp.rename(columns={"ATL (MMM-attributed)": f"ATL {outcome_label}"})
                 fig3 = go.Figure()
                 fig3.add_trace(go.Bar(x=cmp["week_start"], y=cmp["ATL spend (£)"],
                                        name="ATL spend (£)", yaxis="y1",
                                        marker=dict(color="rgba(230,120,40,0.5)")))
-                fig3.add_trace(go.Scatter(x=cmp["week_start"], y=cmp[f"ATL {outcome}"],
-                                          name=f"ATL-attributed {outcome}", yaxis="y2",
+                fig3.add_trace(go.Scatter(x=cmp["week_start"], y=cmp[f"ATL {outcome_label}"],
+                                          name=f"ATL-attributed {outcome_label}", yaxis="y2",
                                           line=dict(color="black", width=2)))
                 fig3.update_layout(
                     height=400, margin=dict(l=10, r=10, t=10, b=10),
                     yaxis=dict(title="ATL spend (£)"),
-                    yaxis2=dict(title=f"ATL-attributed {outcome}", overlaying="y", side="right"),
+                    yaxis2=dict(title=f"ATL-attributed {outcome_label}", overlaying="y", side="right"),
                     legend=dict(orientation="h", yanchor="bottom", y=-0.25),
                 )
                 st.plotly_chart(fig3, use_container_width=True)
@@ -2110,6 +2122,24 @@ Confidence labels reflect spend × FTD volume only. They are **not** statistical
 ### Period comparison
 
 Default mode is "same window in previous month": e.g. 1–28 April 2026 → 1–28 March 2026. Other modes available: previous year (same month, prior year) and immediately preceding equal-length window (GA4-style).
+
+### MMM / ATL terminology
+
+The MMM tab reads the Analytic Partners spreadsheet ("Commercial Mix Modelling"). Definitions to be precise about:
+
+- **Immediate FTDs** — players who registered AND deposited on the same day. This is the primary MMM-modelled KPI in Round 3 (Apr 2026 delivery, covering Jan 2023 – Dec 2025). Earlier rounds modelled **Total FTDs** instead — do not compare across rounds without adjusting.
+- **PAP Wagers (PAPs)** — count of weekly wagers from Paid Active Players. The other modelled KPI; methodology has remained consistent across rounds.
+- **Adstock %** — the share of a week's advertising impact that carries to the following week. Decays geometrically (40% week 1 → 16% week 2 → 6.4% week 3...). Sponsorship (75%) and TV-30s (60%) have the longest tails. Performance channels (Affiliates, Paid Search, Digital Display) are 0% — their effect is immediate.
+- **Media Contribution per week** — Analytic Partners' headline metric: % of weekly outcome attributable to *any* paid media. The complement is the base / organic / unattributed contribution.
+- **NPR ROI** — Net Player Revenue Return on Investment, as reported in Analytic Partners' decks. Not currently computed in this app — sourced from the deck.
+- **ATL channels** — TV, Sponsorship, OOH, Radio, AVOOH, BVOD, Audio. Configurable via `ATL_MMM_CHANNELS` env var if the vendor's channel naming changes.
+- **Performance channels** — Affiliates, Paid Search, Digital Display, Meta. Treated separately from ATL in the MMM tab.
+
+### MMM caveats worth remembering
+
+- MMM is refreshed roughly **twice a year**. The numbers in the MMM tab will be stale most of the time. They're strategic context for budget allocation, not week-to-week tactical adjustment.
+- MMM channel naming does not map 1:1 to the BQ attribution data. Don't compare e.g. "Meta" in MMM directly with "Meta App + Meta Paid Social" in the BQ tables without manual reconciliation.
+- The KPI change from Total FTDs to Immediate FTDs (Round 3, 2026) means YoY comparisons spanning the change need a comment, not just a number.
         """
     )
 
