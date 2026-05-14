@@ -85,6 +85,28 @@ ATL_MMM_CHANNELS = [
     ).split(",") if c.strip()
 ]
 
+# Bundled MMM data file. Lives alongside app.py. Auto-loaded if present.
+# Override via MMM_BUNDLED_FILE env var if you want a different filename.
+MMM_BUNDLED_PATH = Path(__file__).parent / os.environ.get(
+    "MMM_BUNDLED_FILE", "mmm_data.xlsx"
+)
+
+# Mapping from MMM channel names to BQ channel names. Used by the cross-check
+# section comparing MMM-attributed FTDs against platform-attributed FTDs.
+# Edit if vendor renames things or BQ schema changes.
+MMM_BQ_CHANNEL_MAP = [
+    {"name": "Affiliates", "mmm_cols": ["Affiliates"],
+     "bq_channels": ["Affiliate", "Affiliate App"]},
+    {"name": "Meta", "mmm_cols": ["Meta"],
+     "bq_channels": ["Meta App", "Meta Paid Social"]},
+    {"name": "Paid Search", "mmm_cols": ["Paid Search"],
+     "bq_channels": ["PPC Brand", "PPC Generic"]},
+    {"name": "Digital Display", "mmm_cols": ["Digital Display"],
+     "bq_channels": ["Display/Programmatic"]},
+    {"name": "ATL (combined)", "mmm_cols": ATL_MMM_CHANNELS,
+     "bq_channels": ["ATL"]},
+]
+
 # Data-day cutoff: BQ refresh happens before this time. Cache invalidates daily
 # at this UK-local time so a morning visit gets the fresh-loaded data.
 DATA_DAY_CUTOFF_HOUR = int(os.environ.get("DATA_DAY_CUTOFF_HOUR", "8"))
@@ -857,7 +879,7 @@ def main() -> None:
     with tab_saturation:
         page_saturation(df, filters)
     with tab_mmm:
-        page_mmm(mmm_data)
+        page_mmm(mmm_data, df)
     with tab_explorer:
         page_explorer(df_curr, df_prev)  # explorer respects own row-type filter
     with tab_dq:
@@ -1169,35 +1191,60 @@ def _apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 
 
 def _mmm_upload_widget() -> dict | None:
-    """Sidebar upload for Colin's MMM spreadsheet.
+    """Sidebar MMM data loader.
 
-    Persists the parsed result in st.session_state so it survives reruns
-    without forcing a reparse. Returns the parsed dict or None if no file.
+    Priority:
+      1. An explicit upload (sticks in session_state until cleared)
+      2. The bundled MMM_BUNDLED_PATH file if it exists in the repo
+      3. None (MMM tab shows an info message)
+
+    The bundled file refreshes automatically when replaced in git — its mtime
+    is part of the cache key.
     """
-    with st.sidebar.expander("MMM data (Colin's spreadsheet)", expanded=False):
-        st.caption("Upload to enable the MMM / ATL tab. Reads four sheets: "
-                   "`FTD by Channel`, `PAP by Channel`, `Spend by Channel`, "
-                   "`Ad Stock by Channel`.")
-        upl = st.file_uploader("MMM workbook (.xlsx)", type=["xlsx"], key="_mmm_upload")
+    with st.sidebar.expander("MMM data (Analytic Partners)", expanded=False):
+        # Show what's currently loaded
+        if "_mmm_data" in st.session_state:
+            st.caption("Currently loaded: **from upload (overrides bundled file)**")
+        elif MMM_BUNDLED_PATH.exists():
+            st.caption(
+                f"Currently loaded: **from bundled file** "
+                f"(`{MMM_BUNDLED_PATH.name}`, "
+                f"modified {datetime.fromtimestamp(MMM_BUNDLED_PATH.stat().st_mtime).strftime('%Y-%m-%d')})"
+            )
+        else:
+            st.caption("Currently loaded: **none**")
+
+        st.caption(
+            "Replace bundled file via a git push, or upload a one-off here. "
+            "Expects sheets: `FTD by Channel`, `PAP by Channel`, "
+            "`Spend by Channel`, `Ad Stock by Channel`."
+        )
+        upl = st.file_uploader("Upload override (.xlsx)", type=["xlsx"], key="_mmm_upload")
         if upl is not None:
             try:
                 mmm = parse_mmm_workbook(upl.getvalue(), upl.name + str(upl.size))
                 st.session_state["_mmm_data"] = mmm
-                rows_msg = []
-                for k, label in [("ftd", "FTD"), ("pap", "PAP"), ("spend", "Spend")]:
-                    df_k = mmm.get(k)
-                    rows_msg.append(f"{label}: {len(df_k) if df_k is not None else 0}w")
-                st.success(
-                    f"Loaded. {', '.join(rows_msg)}. "
-                    f"Adstock: {len(mmm.get('adstock') or {})} channels."
-                )
+                st.success(f"Override loaded from {upl.name}")
             except Exception as e:
                 st.error(f"Couldn't parse MMM workbook: {e}")
         if "_mmm_data" in st.session_state:
-            if st.button("Clear MMM data", key="_mmm_clear"):
+            if st.button("Clear override (return to bundled)", key="_mmm_clear"):
                 del st.session_state["_mmm_data"]
                 st.rerun()
-        return st.session_state.get("_mmm_data")
+
+    # Resolve source
+    if "_mmm_data" in st.session_state:
+        return st.session_state["_mmm_data"]
+    if MMM_BUNDLED_PATH.exists():
+        try:
+            return parse_mmm_from_path(
+                str(MMM_BUNDLED_PATH),
+                MMM_BUNDLED_PATH.stat().st_mtime,
+            )
+        except Exception as e:
+            st.sidebar.error(f"Bundled MMM file failed to parse: {e}")
+            return None
+    return None
 
 
 def _saved_views_widget(filters, include_unmatched, period, prev_mode, thresholds):
@@ -1579,6 +1626,14 @@ def page_saturation(df_full: pd.DataFrame, filters: dict) -> None:
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
+def parse_mmm_from_path(path: str, mtime: float) -> dict:
+    """Load and parse the bundled MMM file. mtime is the cache key, so the
+    cache invalidates automatically when someone replaces the file in the repo."""
+    with open(path, "rb") as f:
+        return parse_mmm_workbook(f.read(), f"path:{path}:{mtime}")
+
+
+@st.cache_data(show_spinner=False)
 def parse_mmm_workbook(file_bytes: bytes, signature: str) -> dict:
     """Parse Colin's MMM spreadsheet into a structured dict.
 
@@ -1650,7 +1705,7 @@ def _non_atl_media_columns(df: pd.DataFrame) -> list[str]:
     ]
 
 
-def page_mmm(mmm_data: dict | None) -> None:
+def page_mmm(mmm_data: dict | None, df_bq: pd.DataFrame | None = None) -> None:
     st.header("MMM / ATL attribution")
     st.caption(
         "Reads Colin's MMM spreadsheet (Analytic Partners) to surface how much of "
@@ -1819,6 +1874,118 @@ def page_mmm(mmm_data: dict | None) -> None:
             )
         else:
             st.write("Adstock sheet not found in the upload.")
+
+    # === MMM vs platform attribution cross-check ===
+    st.subheader("MMM vs platform attribution (cross-check)")
+    st.caption(
+        "Side-by-side weekly Immediate FTDs as the MMM attributes them vs as "
+        "our platform CSV / BigQuery attributes them. Big discrepancies on a "
+        "click-attributable channel suggest tracking issues; on ATL the "
+        "platform value will be near zero by design (no click path) and the "
+        "MMM value is what you should report."
+    )
+    if df_bq is None or df_bq.empty or "imm_ftd_players" not in df_bq.columns:
+        st.info("No platform data loaded yet — cross-check needs the BQ dataset.")
+    else:
+        # Restrict outcome to Immediate FTDs because that's what imm_ftd_players represents in BQ.
+        if outcome != "Immediate FTDs":
+            st.caption("Cross-check is FTD-only — platform side has no PAP-equivalent column.")
+        else:
+            map_options = [m["name"] for m in MMM_BQ_CHANNEL_MAP]
+            sel = st.selectbox("Channel group", map_options, key="_mmm_xcheck_sel")
+            mapping = next(m for m in MMM_BQ_CHANNEL_MAP if m["name"] == sel)
+            mmm_cols_here = [c for c in mapping["mmm_cols"] if c in src.columns]
+            bq_channels_here = [c for c in mapping["bq_channels"] if c in df_bq["channel"].unique()]
+
+            # MMM side: weekly sum of mapped columns
+            mmm_weekly = src[["week_start"] + mmm_cols_here].copy()
+            mmm_weekly["mmm_ftds"] = mmm_weekly[mmm_cols_here].sum(axis=1)
+            mmm_weekly = mmm_weekly[["week_start", "mmm_ftds"]]
+
+            # BQ side: filter to mapped channels, group by Sunday-anchored week
+            # (MMM uses Sunday week starts; BQ's default helper uses Monday).
+            bq_filtered = df_bq[df_bq["channel"].isin(bq_channels_here)].copy()
+            bq_filtered["mmm_week"] = (
+                bq_filtered["date"] - pd.to_timedelta(
+                    (bq_filtered["date"].dt.weekday + 1) % 7, unit="D"
+                )
+            ).dt.normalize()
+            bq_weekly = (bq_filtered.groupby("mmm_week")["imm_ftd_players"]
+                         .sum().reset_index()
+                         .rename(columns={"imm_ftd_players": "bq_ftds",
+                                          "mmm_week": "week_start"}))
+
+            # Inner join on overlapping weeks
+            cmp = pd.merge(mmm_weekly, bq_weekly, on="week_start", how="inner")
+            if cmp.empty:
+                st.warning(
+                    "No overlapping weeks between MMM and platform data. "
+                    "The MMM window may pre-date the BQ lookback "
+                    f"({BQ_DEFAULT_LOOKBACK_DAYS} days). Increase BQ_DEFAULT_LOOKBACK_DAYS env var."
+                )
+            else:
+                # Visual
+                fig_x = go.Figure()
+                fig_x.add_trace(go.Scatter(x=cmp["week_start"], y=cmp["mmm_ftds"],
+                                            mode="lines+markers",
+                                            name=f"MMM-attributed ({', '.join(mmm_cols_here)})",
+                                            line=dict(color="rgba(230,120,40,0.9)", width=2)))
+                fig_x.add_trace(go.Scatter(x=cmp["week_start"], y=cmp["bq_ftds"],
+                                            mode="lines+markers",
+                                            name=f"Platform-attributed ({', '.join(bq_channels_here)})",
+                                            line=dict(color="rgba(70,140,220,0.9)", width=2)))
+                fig_x.update_layout(
+                    height=400, hovermode="x unified",
+                    yaxis_title="Weekly Immediate FTDs", xaxis_title="Week",
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.25),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                )
+                st.plotly_chart(fig_x, use_container_width=True)
+
+                # Summary metrics + reconciliation table
+                total_mmm = float(cmp["mmm_ftds"].sum())
+                total_bq = float(cmp["bq_ftds"].sum())
+                gap = total_mmm - total_bq
+                gap_pct = pct_change(total_mmm, total_bq)
+                summary_cols = st.columns(4)
+                summary_cols[0].metric("MMM total FTDs (overlap window)", fmt_int(total_mmm))
+                summary_cols[1].metric("Platform total FTDs (overlap window)", fmt_int(total_bq))
+                summary_cols[2].metric("Gap (MMM − Platform)", fmt_int(gap))
+                summary_cols[3].metric(
+                    "% gap vs platform",
+                    fmt_pct(gap_pct) if not pd.isna(gap_pct) else "n/a",
+                    help="Positive % means MMM attributes more than the platform reports — "
+                         "ATL/brand channels will naturally show very positive gaps."
+                )
+
+                # Per-week diff table (collapsed)
+                with st.expander("Weekly reconciliation table"):
+                    tbl = cmp.assign(
+                        diff=cmp["mmm_ftds"] - cmp["bq_ftds"],
+                        diff_pct=[pct_change(a, b) for a, b in zip(cmp["mmm_ftds"], cmp["bq_ftds"])],
+                    ).round(1)
+                    tbl["week_start"] = tbl["week_start"].dt.strftime("%Y-%m-%d")
+                    tbl = tbl.rename(columns={
+                        "mmm_ftds": "MMM FTDs",
+                        "bq_ftds": "Platform FTDs",
+                        "diff": "Gap",
+                        "diff_pct": "Gap %",
+                    })
+                    st.dataframe(tbl, use_container_width=True, hide_index=True)
+
+                # Interpretive note
+                if sel == "ATL (combined)":
+                    st.info(
+                        "ATL cross-check: a large positive gap is expected and **correct** — "
+                        "ATL media isn't click-attributable so the platform side will be "
+                        "close to zero. The MMM number is the number to quote for ATL FTDs."
+                    )
+                elif not pd.isna(gap_pct) and abs(gap_pct) > 50:
+                    st.warning(
+                        f"Materially different attribution on {sel}: MMM and platform differ by "
+                        f"{abs(gap_pct):.0f}% in the overlap window. Worth investigating "
+                        "tracking coverage, attribution windowing, or model drift."
+                    )
 
     # Spend overlay if available
     if spend is not None and not spend.empty:

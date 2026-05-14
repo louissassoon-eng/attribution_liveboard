@@ -1,5 +1,8 @@
 # Data files (CSV exports, BQ pulls, etc.) — never commit
 *.csv
+# Bundled MMM data from Analytic Partners (mmm_data.xlsx) — replace when refreshed
+*.xlsx
+!mmm_data.xlsx
 
 # Credentials — never commit any JSON (service account keys are JSON)
 *.json
