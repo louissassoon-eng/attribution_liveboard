@@ -11,3 +11,4 @@ kaleido==0.2.1            # optional, enables Plotly chart image export from the
 google-cloud-bigquery>=3.20  # BigQuery client
 db-dtypes>=1.2            # pandas dtype support for BQ types (DATE, TIME, NUMERIC, etc.)
 google-cloud-bigquery-storage>=2.24  # optional but speeds up large BQ pulls
+openpyxl>=3.1             # parses Colin's MMM spreadsheet

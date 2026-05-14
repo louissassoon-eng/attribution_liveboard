@@ -75,6 +75,16 @@ BRAND_CHANNELS = set(
     c.strip() for c in os.environ.get("BRAND_CHANNELS", "ATL").split(",") if c.strip()
 )
 
+# Channels classed as Above The Line in Colin's MMM spreadsheet — i.e. media
+# whose effect is mediated by impressions/exposure rather than a click.
+# Override with ATL_MMM_CHANNELS env var if Colin renames things.
+ATL_MMM_CHANNELS = [
+    c.strip() for c in os.environ.get(
+        "ATL_MMM_CHANNELS",
+        "TV,Sponsorship,OOH,Radio,AVOOH,BVOD,Audio"
+    ).split(",") if c.strip()
+]
+
 # Data-day cutoff: BQ refresh happens before this time. Cache invalidates daily
 # at this UK-local time so a morning visit gets the fresh-loaded data.
 DATA_DAY_CUTOFF_HOUR = int(os.environ.get("DATA_DAY_CUTOFF_HOUR", "8"))
@@ -818,6 +828,9 @@ def main() -> None:
     df_curr_eff = filter_efficiency(df_curr, include_unmatched)
     df_prev_eff = filter_efficiency(df_prev, include_unmatched)
 
+    # MMM upload (optional, enables MMM/ATL tab)
+    mmm_data = _mmm_upload_widget()
+
     # Saved views & top banner
     _saved_views_widget(filters, include_unmatched, period, prev_mode, thresholds)
 
@@ -826,11 +839,12 @@ def main() -> None:
     # Page nav (tabs across the top). st.tabs renders all bodies on every
     # rerun, but the heavy work (BQ fetch + _shape) is cached, so this is
     # cheap. Per-page aggregations are recomputed cheaply from the shaped df.
-    (tab_overview, tab_channels, tab_saturation, tab_explorer,
+    (tab_overview, tab_channels, tab_saturation, tab_mmm, tab_explorer,
      tab_dq, tab_recs, tab_dict) = st.tabs([
         "Executive Overview",
         "Channel View",
         "Saturation",
+        "MMM / ATL",
         "Campaign / Ad Explorer",
         "Data Quality",
         "Recommendations",
@@ -842,6 +856,8 @@ def main() -> None:
         page_channels(df_curr_eff, df_prev_eff)
     with tab_saturation:
         page_saturation(df, filters)
+    with tab_mmm:
+        page_mmm(mmm_data)
     with tab_explorer:
         page_explorer(df_curr, df_prev)  # explorer respects own row-type filter
     with tab_dq:
@@ -1150,6 +1166,38 @@ def _apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
         if col in out.columns and sel:
             out = out[out[col].isin(sel)]
     return out
+
+
+def _mmm_upload_widget() -> dict | None:
+    """Sidebar upload for Colin's MMM spreadsheet.
+
+    Persists the parsed result in st.session_state so it survives reruns
+    without forcing a reparse. Returns the parsed dict or None if no file.
+    """
+    with st.sidebar.expander("MMM data (Colin's spreadsheet)", expanded=False):
+        st.caption("Upload to enable the MMM / ATL tab. Reads four sheets: "
+                   "`FTD by Channel`, `PAP by Channel`, `Spend by Channel`, "
+                   "`Ad Stock by Channel`.")
+        upl = st.file_uploader("MMM workbook (.xlsx)", type=["xlsx"], key="_mmm_upload")
+        if upl is not None:
+            try:
+                mmm = parse_mmm_workbook(upl.getvalue(), upl.name + str(upl.size))
+                st.session_state["_mmm_data"] = mmm
+                rows_msg = []
+                for k, label in [("ftd", "FTD"), ("pap", "PAP"), ("spend", "Spend")]:
+                    df_k = mmm.get(k)
+                    rows_msg.append(f"{label}: {len(df_k) if df_k is not None else 0}w")
+                st.success(
+                    f"Loaded. {', '.join(rows_msg)}. "
+                    f"Adstock: {len(mmm.get('adstock') or {})} channels."
+                )
+            except Exception as e:
+                st.error(f"Couldn't parse MMM workbook: {e}")
+        if "_mmm_data" in st.session_state:
+            if st.button("Clear MMM data", key="_mmm_clear"):
+                del st.session_state["_mmm_data"]
+                st.rerun()
+        return st.session_state.get("_mmm_data")
 
 
 def _saved_views_widget(filters, include_unmatched, period, prev_mode, thresholds):
@@ -1524,6 +1572,267 @@ def page_saturation(df_full: pd.DataFrame, filters: dict) -> None:
             ].rename(columns={"outcome": outcome_metric}).round(2),
             use_container_width=True, hide_index=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# 15c. PAGE: MMM — ATL ATTRIBUTION
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def parse_mmm_workbook(file_bytes: bytes, signature: str) -> dict:
+    """Parse Colin's MMM spreadsheet into a structured dict.
+
+    Expected sheets: 'FTD by Channel', 'PAP by Channel', 'Spend by Channel',
+    'Ad Stock by Channel'. Returns long-form weekly frames keyed by sheet
+    name and an adstock dict.
+
+    Defensive: handles the header layout where the first row is a section
+    title and the second row contains column names.
+    """
+    out: dict = {"ftd": None, "pap": None, "spend": None, "adstock": {},
+                 "channels": [], "totals_col": {}, "media_contrib_col": {}}
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+
+    def _read_weekly(sheet: str, totals_label_hint: list[str]) -> pd.DataFrame | None:
+        if sheet not in xls.sheet_names:
+            return None
+        # Header row is the second row; first row is a section title.
+        df = pd.read_excel(xls, sheet_name=sheet, header=1)
+        # First column is the week date (the original header was 'Deposits'
+        # or blank); rename to a stable name.
+        first_col = df.columns[0]
+        df = df.rename(columns={first_col: "week_start"})
+        df["week_start"] = pd.to_datetime(df["week_start"], errors="coerce")
+        df = df.dropna(subset=["week_start"]).reset_index(drop=True)
+        # Strip whitespace from column names
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
+
+    out["ftd"] = _read_weekly("FTD by Channel", ["Immediate FTDs"])
+    out["pap"] = _read_weekly("PAP by Channel", ["PAPs"])
+    out["spend"] = _read_weekly("Spend by Channel", [])
+
+    # Adstock sheet: small reference table with Channel / Ad Stock cols
+    if "Ad Stock by Channel" in xls.sheet_names:
+        ads = pd.read_excel(xls, sheet_name="Ad Stock by Channel", header=1)
+        ads = ads.dropna(how="all").reset_index(drop=True)
+        ads.columns = [str(c).strip() for c in ads.columns]
+        if {"Channel", "Ad Stock"}.issubset(ads.columns):
+            ads = ads[["Channel", "Ad Stock"]].dropna()
+            out["adstock"] = dict(zip(ads["Channel"].astype(str), ads["Ad Stock"].astype(float)))
+
+    return out
+
+
+def _atl_columns_present(df: pd.DataFrame) -> list[str]:
+    """Subset of ATL_MMM_CHANNELS that actually exist as columns in df."""
+    if df is None or df.empty:
+        return []
+    return [c for c in ATL_MMM_CHANNELS if c in df.columns]
+
+
+def _non_atl_media_columns(df: pd.DataFrame) -> list[str]:
+    """Non-ATL channel columns in the weekly sheet (Affiliates, Paid Search, Meta, etc.).
+
+    Excludes the totals, contribution %, week_start, ATL channels, and any
+    unnamed/spacer columns Excel leaves behind.
+    """
+    if df is None or df.empty:
+        return []
+    skip = {"week_start", "Immediate FTDs", "PAPs",
+            "Media Contribution per week"} | set(ATL_MMM_CHANNELS)
+    return [
+        c for c in df.columns
+        if c not in skip
+        and not str(c).startswith("Unnamed")
+        and not pd.api.types.is_datetime64_any_dtype(df[c])
+        and df[c].dtype.kind in "iuf"
+    ]
+
+
+def page_mmm(mmm_data: dict | None) -> None:
+    st.header("MMM / ATL attribution")
+    st.caption(
+        "Reads Colin's MMM spreadsheet to surface how much of weekly Immediate "
+        "FTDs the model attributes to Above-The-Line media. The headline chart "
+        "is the answer to 'what looks organic but is actually being driven by "
+        "TV / Radio / OOH / Sponsorship / Audio etc.'"
+    )
+
+    if mmm_data is None:
+        st.info(
+            "Upload Colin's MMM spreadsheet in the sidebar (under **MMM data**) "
+            "to populate this tab. Expected sheets: `FTD by Channel`, "
+            "`PAP by Channel`, `Spend by Channel`, `Ad Stock by Channel`."
+        )
+        return
+
+    ftd = mmm_data.get("ftd")
+    pap = mmm_data.get("pap")
+    spend = mmm_data.get("spend")
+    adstock = mmm_data.get("adstock") or {}
+
+    if ftd is None or ftd.empty:
+        st.error("Couldn't find a usable `FTD by Channel` sheet in the upload.")
+        return
+
+    # Outcome toggle
+    outcome = st.radio("Outcome", ["Immediate FTDs", "PAPs"], horizontal=True, index=0)
+    src = ftd if outcome == "Immediate FTDs" else pap
+    if src is None or src.empty:
+        st.warning(f"No `{outcome}` sheet found in the upload.")
+        return
+
+    # Date filter
+    min_d = pd.Timestamp(src["week_start"].min()).date()
+    max_d = pd.Timestamp(src["week_start"].max()).date()
+    date_range = st.date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        d0, d1 = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
+        src = src[(src["week_start"] >= d0) & (src["week_start"] <= d1)].copy()
+
+    atl_cols = _atl_columns_present(src)
+    other_cols = _non_atl_media_columns(src)
+    totals_col = ("Immediate FTDs" if outcome == "Immediate FTDs"
+                  else ("PAPs" if "PAPs" in src.columns else None))
+    contrib_col = "Media Contribution per week" if "Media Contribution per week" in src.columns else None
+
+    if not atl_cols:
+        st.warning(
+            f"None of the configured ATL channels ({', '.join(ATL_MMM_CHANNELS)}) "
+            f"were found as columns in the sheet. Override via ATL_MMM_CHANNELS env var."
+        )
+
+    # Build aggregated weekly view
+    agg = src[["week_start"]].copy()
+    agg["ATL (MMM-attributed)"] = src[atl_cols].sum(axis=1) if atl_cols else 0
+    agg["Other media (MMM-attributed)"] = src[other_cols].sum(axis=1) if other_cols else 0
+    if totals_col and totals_col in src.columns:
+        agg["Total"] = pd.to_numeric(src[totals_col], errors="coerce")
+        agg["Non-media (organic / unattributed)"] = (
+            agg["Total"] - agg["ATL (MMM-attributed)"] - agg["Other media (MMM-attributed)"]
+        ).clip(lower=0)
+    else:
+        agg["Total"] = agg["ATL (MMM-attributed)"] + agg["Other media (MMM-attributed)"]
+        agg["Non-media (organic / unattributed)"] = 0
+
+    # === HEADLINE CHART: stacked area showing the ATL wedge under the total ===
+    st.subheader(f"Weekly {outcome} — what MMM says is ATL-driven")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=agg["week_start"], y=agg["Non-media (organic / unattributed)"],
+        mode="lines", name="Non-media (organic / unattributed)",
+        stackgroup="one", line=dict(width=0.5), fillcolor="rgba(180,180,180,0.6)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=agg["week_start"], y=agg["Other media (MMM-attributed)"],
+        mode="lines", name="Other media (Affiliates/PPC/Meta/etc.)",
+        stackgroup="one", line=dict(width=0.5), fillcolor="rgba(70,140,220,0.7)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=agg["week_start"], y=agg["ATL (MMM-attributed)"],
+        mode="lines", name="ATL uplift (TV/Sponsorship/OOH/Radio/Audio/etc.)",
+        stackgroup="one", line=dict(width=0.5), fillcolor="rgba(230,120,40,0.85)",
+    ))
+    fig.add_trace(go.Scatter(
+        x=agg["week_start"], y=agg["Total"],
+        mode="lines", name=f"Total {outcome}", line=dict(color="black", width=2),
+    ))
+    fig.update_layout(
+        height=460, hovermode="x unified",
+        yaxis_title=outcome, xaxis_title="Week",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25),
+        margin=dict(l=10, r=10, t=10, b=10),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Summary metrics over the visible window
+    total_outcome = float(agg["Total"].sum())
+    total_atl = float(agg["ATL (MMM-attributed)"].sum())
+    total_other = float(agg["Other media (MMM-attributed)"].sum())
+    total_organic = float(agg["Non-media (organic / unattributed)"].sum())
+    cols = st.columns(4)
+    cols[0].metric(f"Total {outcome}", fmt_int(total_outcome))
+    cols[1].metric("ATL-attributed",
+                   fmt_int(total_atl),
+                   delta=f"{(total_atl/total_outcome*100):.1f}% share" if total_outcome else None,
+                   delta_color="off")
+    cols[2].metric("Other media", fmt_int(total_other),
+                   delta=f"{(total_other/total_outcome*100):.1f}% share" if total_outcome else None,
+                   delta_color="off")
+    cols[3].metric("Organic / unattributed", fmt_int(total_organic),
+                   delta=f"{(total_organic/total_outcome*100):.1f}% share" if total_outcome else None,
+                   delta_color="off")
+
+    # === Per-channel MMM-attributed FTDs over time ===
+    st.subheader(f"{outcome} by channel (MMM attribution)")
+    long_rows = []
+    for ch in atl_cols + other_cols:
+        for _, r in src[["week_start", ch]].iterrows():
+            long_rows.append({"week_start": r["week_start"], "channel": ch,
+                              "value": pd.to_numeric(r[ch], errors="coerce") or 0,
+                              "group": "ATL" if ch in atl_cols else "Other media"})
+    long_df = pd.DataFrame(long_rows)
+    if not long_df.empty:
+        fig2 = px.line(long_df, x="week_start", y="value", color="channel",
+                       facet_col="group", facet_col_wrap=1,
+                       title=f"{outcome} per channel — left side ATL, right side digital media")
+        fig2.update_layout(height=520, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # === Media contribution % ===
+    if contrib_col and contrib_col in src.columns:
+        st.subheader("Media contribution % per week (Colin's metric)")
+        st.caption("% of weekly outcome that the MMM attributes to *any* paid media. The complement is the organic / brand-baseline contribution.")
+        st.plotly_chart(
+            line_chart(src[["week_start", contrib_col]].assign(
+                **{contrib_col: pd.to_numeric(src[contrib_col], errors="coerce") * 100}
+            ).rename(columns={contrib_col: "media_contribution_pct"}),
+                "week_start", "media_contribution_pct", title=""),
+            use_container_width=True,
+        )
+
+    # === Adstock reference ===
+    with st.expander("Adstock coefficients (Colin's MMM, % retained each subsequent week)"):
+        if adstock:
+            ads_df = pd.DataFrame(
+                [(k, v) for k, v in adstock.items()],
+                columns=["Channel", "Adstock %"]
+            ).sort_values("Adstock %", ascending=False)
+            st.dataframe(ads_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "Higher = more of the spend's impact carries to the following week. "
+                "Sponsorship (75%) and TV-30s (60%) have the longest tails; "
+                "click-driven channels (Affiliates, Paid Search, Digital Display) are 0% by design."
+            )
+        else:
+            st.write("Adstock sheet not found in the upload.")
+
+    # Spend overlay if available
+    if spend is not None and not spend.empty:
+        with st.expander("ATL spend vs ATL-attributed FTDs (sanity check)"):
+            atl_spend_cols = [c for c in ATL_MMM_CHANNELS if c in spend.columns]
+            if atl_spend_cols:
+                spend_w = spend[(spend["week_start"] >= pd.Timestamp(date_range[0])) &
+                                (spend["week_start"] <= pd.Timestamp(date_range[1]))]
+                cmp = spend_w[["week_start"]].copy()
+                cmp["ATL spend (£)"] = spend_w[atl_spend_cols].sum(axis=1)
+                cmp = cmp.merge(agg[["week_start", "ATL (MMM-attributed)"]], on="week_start", how="inner")
+                cmp = cmp.rename(columns={"ATL (MMM-attributed)": f"ATL {outcome}"})
+                fig3 = go.Figure()
+                fig3.add_trace(go.Bar(x=cmp["week_start"], y=cmp["ATL spend (£)"],
+                                       name="ATL spend (£)", yaxis="y1",
+                                       marker=dict(color="rgba(230,120,40,0.5)")))
+                fig3.add_trace(go.Scatter(x=cmp["week_start"], y=cmp[f"ATL {outcome}"],
+                                          name=f"ATL-attributed {outcome}", yaxis="y2",
+                                          line=dict(color="black", width=2)))
+                fig3.update_layout(
+                    height=400, margin=dict(l=10, r=10, t=10, b=10),
+                    yaxis=dict(title="ATL spend (£)"),
+                    yaxis2=dict(title=f"ATL-attributed {outcome}", overlaying="y", side="right"),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.25),
+                )
+                st.plotly_chart(fig3, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
