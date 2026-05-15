@@ -1750,13 +1750,20 @@ def page_mmm(mmm_data: dict | None, df_bq: pd.DataFrame | None = None) -> None:
         st.warning(f"No `{outcome}` sheet found in the upload.")
         return
 
-    # Date filter
+    # Date filter. Streamlit's date_input returns a 1-tuple while the user is
+    # mid-selection (between clicking the first and second date), so we have
+    # to defend against that and fall back to the full range.
     min_d = pd.Timestamp(src["week_start"].min()).date()
     max_d = pd.Timestamp(src["week_start"].max()).date()
-    date_range = st.date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+    date_range = st.date_input("Date range", value=(min_d, max_d),
+                                min_value=min_d, max_value=max_d)
     if isinstance(date_range, tuple) and len(date_range) == 2:
         d0, d1 = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
-        src = src[(src["week_start"] >= d0) & (src["week_start"] <= d1)].copy()
+    elif isinstance(date_range, tuple) and len(date_range) == 1:
+        d0, d1 = pd.Timestamp(date_range[0]), pd.Timestamp(max_d)
+    else:  # single date or unexpected shape
+        d0, d1 = pd.Timestamp(min_d), pd.Timestamp(max_d)
+    src = src[(src["week_start"] >= d0) & (src["week_start"] <= d1)].copy()
 
     atl_cols = _atl_columns_present(src)
     other_cols = _non_atl_media_columns(src)
@@ -1992,8 +1999,7 @@ def page_mmm(mmm_data: dict | None, df_bq: pd.DataFrame | None = None) -> None:
         with st.expander("ATL spend vs ATL-attributed FTDs (sanity check)"):
             atl_spend_cols = [c for c in ATL_MMM_CHANNELS if c in spend.columns]
             if atl_spend_cols:
-                spend_w = spend[(spend["week_start"] >= pd.Timestamp(date_range[0])) &
-                                (spend["week_start"] <= pd.Timestamp(date_range[1]))]
+                spend_w = spend[(spend["week_start"] >= d0) & (spend["week_start"] <= d1)]
                 cmp = spend_w[["week_start"]].copy()
                 cmp["ATL spend (£)"] = spend_w[atl_spend_cols].sum(axis=1)
                 cmp = cmp.merge(agg[["week_start", "ATL (MMM-attributed)"]], on="week_start", how="inner")
